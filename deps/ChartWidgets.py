@@ -50,6 +50,12 @@ def prepareHistoData(dutList: np.ndarray,
     normalize = settings.histo.norm_histobars
     horizontalBar = not settings.gen.vert_bar
     
+    # The caller hands over float32 PTR values. For a constant parameter with a large
+    # magnitude (e.g. 8.8177e8 or +/-6502500) float32 cannot represent a half-ULP span,
+    # so the histogram bins collapse and np.digitize disagrees with the bin edges, which
+    # surfaces as KeyError from bin_dut_dict[ind] (numpy>=1.24 raises ValueError from
+    # np.digitize first). Do binning and the bin lookup in float64 instead.
+    dataList = np.asarray(dataList, dtype=np.float64)
     hist, edges = np.histogram(dataList, bins=binCount)
     bin_width = edges[1]-edges[0]
     # get left edges
