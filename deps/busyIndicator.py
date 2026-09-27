@@ -21,8 +21,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-# Spinner plus an attachable busy overlay, so individual panes can show their
-# own spinner while the rest of the window stays usable.
+# Spinner plus an attachable busy overlay, so one pane can spin on its own.
 #
 
 import logging
@@ -84,8 +83,7 @@ class BusyOverlay(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("busyOverlay")
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
-        # purely decorative: clicks go to the covered widgets, so the windows
-        # behind the overlay stay usable
+        # decorative: clicks pass through to the covered widgets
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.setStyleSheet("QWidget#busyOverlay { background-color: rgba(255, 255, 255, 150); }")
@@ -184,7 +182,6 @@ class BusyManager:
         """Start a spinner on `panes`; hidden panes only remember the text."""
         panes = self._allowed(panes)
         # drop spinners of a previous call, otherwise a narrower follow-up
-        # update leaves the earlier ones turning next to the new one
         for pane in self._shown:
             if pane not in panes:
                 self._overlayFor(pane).stop()

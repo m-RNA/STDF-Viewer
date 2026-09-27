@@ -21,10 +21,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-# Selection queries on a worker thread.  `DataFetcher` is unsendable, so the
-# worker builds its own `DataInterface` inside its thread and answers through a
-# queued signal; only the newest pending request is kept, and every answer
-# carries its request id so stale results can be dropped.
+# Selection queries on a worker thread, which builds its own DataInterface.
 #
 
 import logging
@@ -152,12 +149,10 @@ class SelectionWorker(QtCore.QObject):
     @staticmethod
     def _statistics(di: DataInterface, request: SelectionRequest):
         if request.tabType == tab.Bin:
-            # the bin table is a bin distribution, the selected tests are
-            # irrelevant for it
+            # the bin table is a distribution, so tests do not apply
             return di.getBinStatistics(request.heads, request.sites)
         if request.tabType == tab.Wafer:
-            # wafer rows come from the selected wafers (test selection is
-            # disabled on that tab), while the charts use getWaferMapData
+            # wafer rows come from the selected wafers
             return di.getWaferStatistics(request.selTests, request.sites)
         if request.tabType in (tab.Info, tab.Trend, tab.Histo, tab.PPQQ):
             return di.getTestStatistics(request.selTests, request.heads, request.sites)
@@ -177,8 +172,7 @@ class SelectionWorker(QtCore.QObject):
                             for testTuple in request.selTests
                             for head in request.heads]
         elif request.tabType == tab.Wafer:
-            # the wafer list provides the tuples the wafer charts index by
-            # (test selection is disabled on this tab)
+            # the wafer list provides the tuples the charts index
             out["plots"] = [(waferTuple, None,
                              di.getWaferMapData(waferTuple, request.sites))
                             for waferTuple in request.waferSelection]
