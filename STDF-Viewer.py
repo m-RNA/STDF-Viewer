@@ -154,6 +154,8 @@ class MyWindow(QtWidgets.QMainWindow):
         # True from the moment a load starts until the new data is in place;
         # while set, every pane without content spins (see _defaultBusyPanes)
         self._fileLoading = False
+        # set when the user asked to close while a load was still running
+        self._closeRequested = False
         self.loader.signals.progressBarSignal.connect(self.onLoaderProgress)
         self.loader.signals.statsSignal.connect(self.updateEarlyStats)
         # selection queries run on a worker thread; results land in the GUI
@@ -1689,6 +1691,10 @@ class MyWindow(QtWidgets.QMainWindow):
                 self._hideBusyAfterPaint()
             # otherwise onSelectionReady() clears the busy state when the
             # worker thread hands over the first selection's data
+            if self._closeRequested:
+                # the user wanted out while this was still building; the loader
+                # has finished, so closing now does not cut the thread short
+                self.close()
 
     
     @Slot(int)
@@ -1931,6 +1937,20 @@ class MyWindow(QtWidgets.QMainWindow):
       
         
     def closeEvent(self, event):
+        # A build in progress is the loader's business: ask before dropping it
+        # and let the thread finish instead of killing it. Same check as on the
+        # progressive half, so neither order of merging loses the prompt.
+        thread = self.loader.__dict__.get("thread")
+        if thread is not None and thread.isRunning():
+            answer = QMessageBox.question(
+                self, self.tr("QUIT"),
+                self.tr("Are you sure want to stop reading?"),
+                QMessageBox.Yes | QMessageBox.No)
+            if answer == QMessageBox.Yes:
+                self._closeRequested = True
+                self.loader.reader.flag.stop = True
+            event.ignore()
+            return
         # stop the selection worker before the GUI goes away
         try:
             self._selectDebounce.stop()
