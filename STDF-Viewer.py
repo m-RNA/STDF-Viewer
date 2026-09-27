@@ -1955,7 +1955,12 @@ class MyWindow(QtWidgets.QMainWindow):
                 QMessageBox.Yes | QMessageBox.No)
             if answer == QMessageBox.Yes:
                 self._closeRequested = True
-                self.loader.reader.flag.stop = True
+                # closeLoader() drops the reader once the thread is done, so a
+                # build that finished while the question was up has nothing left
+                # to stop -- the queued closeSignal closes the window instead
+                reader = self.loader.reader
+                if reader is not None:
+                    reader.flag.stop = True
             event.ignore()
             return
         # stop the selection worker before the GUI goes away
