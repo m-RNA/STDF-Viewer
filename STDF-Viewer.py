@@ -33,6 +33,8 @@ from itertools import product
 from deps.SharedSrc import *
 from deps.ui.transSrc import transDict
 from deps.DataInterface import DataInterface
+from deps.busyIndicator import BusyManager, BusyOverlay
+from deps.SelectionWorker import SelectionRequest, SelectionWorker
 from deps.customizedQtClass import *
 from deps.ChartWidgets import *
 from deps.uic_stdLoader import COUNTER_LABELS, format_header_info, stdfLoader
@@ -89,6 +91,10 @@ class signals4MainUI(QtCore.QObject):
 
 
 class MyWindow(QtWidgets.QMainWindow):
+    # infoBox page index of "Test Summary" (the raw data table)
+    _RAW_DATA_PAGE = 2
+
+
     def __init__(self):
         super(MyWindow, self).__init__()
         self.ui = Ui_MainWindow()
@@ -138,14 +144,31 @@ class MyWindow(QtWidgets.QMainWindow):
         self.loaderProgress.setFormat("0.00%")
         self.loaderProgress.hide()
         self.statusBar().addPermanentWidget(self.loaderProgress)
+        # every visible pane gets its own spinner; the progress bar stays
+        # in the status bar
+        self._busy = BusyManager(self, is_allowed=self._isPaneAllowedToBeBusy)
         # grey italic font for the File Info counters that are still running;
         # same point size so marking a row cannot change its height
         self._counterFont = QtGui.QFont()
         self._counterFont.setItalic(True)
-        # True from the moment a load starts until the new data is in place
+        # True from the moment a load starts until the new data is in place;
+        # while set, every pane without content spins (see _defaultBusyPanes)
         self._fileLoading = False
         self.loader.signals.progressBarSignal.connect(self.onLoaderProgress)
         self.loader.signals.statsSignal.connect(self.updateEarlyStats)
+        # selection queries run on a worker thread; results land in the GUI
+        # thread through this queued signal
+        self._selectionWorker = None
+        self._selectionGen = 0
+        self._pendingSelect = None
+        self._selectDebounce = QtCore.QTimer(self)
+        self._selectDebounce.setSingleShot(True)
+        self._selectDebounce.setInterval(60)
+        self._selectDebounce.timeout.connect(self._startSelectionUpdate)
+        # switching pages while busy: the new page must get its own spinner
+        self.ui.tabControl.currentChanged.connect(self.showBusyOnVisiblePages)
+        self.ui.infoBox.currentChanged.connect(self.showBusyOnVisiblePages)
+        self.ui.infoBox.currentChanged.connect(self.onInfoPageChanged)
         self.mergePanel = MergePanel(self)
         self.failmarker = FailMarker(self)
         self.exporter = stdfExporter(self)
@@ -186,7 +209,8 @@ class MyWindow(QtWidgets.QMainWindow):
                          tab.Correlate: {"scroll": self.ui.scrollArea_correlation, "layout": self.ui.verticalLayout_correlation}}
         # init callback for UI component
         self.ui.tabControl.currentChanged.connect(self.onSelect)
-        self.ui.infoBox.currentChanged.connect(self.updateTestDataTable)
+        # the infoBox callback is wired in __init__ (onInfoPageChanged) because
+        # the raw data table is filled by the selection worker now
 
         # set drop down menu for session action
         self.utilityMenu = QtWidgets.QMenu()
@@ -960,17 +984,139 @@ class MyWindow(QtWidgets.QMainWindow):
             # statistic table
             updateStat = updateStat or tabChanged
                     
-            if updateStat:
-                self.updateStatTableContent()   # update statistic table
-            if updateTab:
-                self.updateTabContent()         # update tab
-            
-            self.preTab = currentTab
+            # rendering is deferred, so switching tabs must rebuild that tab's
+            # content even when the selection did not change
+            updateTab = updateTab or tabChanged
+                    
+            if updateStat or updateTab:
+                # the list stays enabled: the query no longer blocks the GUI,
+                # and disabling it would draw the author's greyed-out boxes
+                self.showBusy(panes=[self._busyPaneForTab(currentTab, updateTab)])
+                # the queries run on the worker thread; the UI stays responsive
+                # while they are in flight, so no processEvents() pumping here
+                self._queueSelectionUpdate(currentTab, selTests, selHeads, selSites,
+                                           updateStat, updateTab)
+            else:
+                self.preTab = currentTab
             
             # always update pre selection at last
             self.selectionTracker[currentTab] = (selHeads, selSites, selTests)
     
     
+    def _busyPaneForTab(self, tabType, drawsCharts: bool):
+        """Spinner target for `tabType`: chart tabs spin, Detailed Info does not."""
+        page = self.ui.tabControl.widget(tabType)
+        if drawsCharts and tabType not in (tab.Info, tab.Correlate):
+            if self._isPaneAllowedToBeBusy(page):
+                return page
+        return self._statisticsPane()
+
+    def _queueSelectionUpdate(self, currentTab, selTests, selHeads, selSites,
+                              updateStat, updateTab):
+        """Remember the newest selection and (re)start the debounce timer."""
+        self._pendingSelect = {
+            "tab": currentTab,
+            "tests": sorted(selTests),
+            "heads": sorted(selHeads),
+            "sites": sorted(selSites),
+            # the wafer tab indexes charts by wafer, not by test
+            "wafers": sorted(self.getSelectedWafers()) if currentTab == tab.Wafer else [],
+            "updateStat": updateStat,
+            "updateTab": updateTab,
+        }
+        self._selectionGen += 1
+        self._selectDebounce.start()
+    
+    
+    def _ensureSelectionWorker(self):
+        if self._selectionWorker is None:
+            self._selectionWorker = SelectionWorker(self.data_interface.dbPath, self)
+            self._selectionWorker.resultReady.connect(self.onSelectionReady)
+            self._selectionWorker.start()
+        return self._selectionWorker
+    
+    
+    def _startSelectionUpdate(self):
+        """Build the work order from the pending selection and hand it over."""
+        pending = self._pendingSelect
+        if pending is None or self.data_interface is None:
+            return
+        needRawData = (pending["tab"] == tab.Info
+                       and self.ui.infoBox.currentIndex() == self._RAW_DATA_PAGE)
+        request = SelectionRequest(self._selectionGen,
+                                   pending["tab"],
+                                   pending["tests"],
+                                   pending["heads"],
+                                   pending["sites"],
+                                   pending["updateStat"],
+                                   pending["updateTab"],
+                                   needRawData,
+                                   pending.get("wafers") or [])
+        self._ensureSelectionWorker().submit(request)
+    
+    
+    @Slot(int, object)
+    def onSelectionReady(self, requestId: int, payload):
+        """GUI thread: render what the worker computed (dropping stale answers)."""
+        if requestId != self._selectionGen or self.data_interface is None:
+            return
+        pending = self._pendingSelect
+        self._pendingSelect = None
+        if payload is None:
+            logger.error("selection worker returned no data")
+            self._finishSelection(None)
+            return
+        if "stat" in payload:
+            self.applyStatTableContent(payload["stat"],
+                                       pending["tab"] if pending else None)
+        if pending is not None:
+            self.applyTabContent(pending["tab"], payload)
+        self._finishSelection(pending)
+    
+    
+    def _finishSelection(self, pending):
+        """Hide the spinners and commit the tab state.
+
+        Wait two event-queue passes first: building widgets only queues layout
+        and paint work, so hiding sooner drops the spinner before the chart
+        appears.
+        """
+        if pending is not None:
+            self.preTab = pending["tab"]
+        self._hideBusyAfterPaint()
+
+    def _hideBusyAfterPaint(self):
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(0, self._hideBusyFinal)
+
+    def _hideBusyFinal(self):
+        if self._pendingSelect is not None or self._selectDebounce.isActive():
+            # newer work started in the meantime, keep its spinner up
+            return
+        QtWidgets.QApplication.processEvents()
+        self.hideBusy()
+        self.loaderProgress.hide()
+    
+    
+    @Slot()
+    def onInfoPageChanged(self):
+        """Test Summary page needs its own query once it becomes visible."""
+        if self.data_interface is None:
+            return
+        if self.ui.infoBox.currentIndex() != self._RAW_DATA_PAGE:
+            return
+        if self.ui.tabControl.currentIndex() != tab.Info:
+            return
+        self.showBusy(panes=[self._busyPaneForTab(tab.Info, True)])
+        self._queueSelectionUpdate(tab.Info,
+                                   set(self.getSelectedTests()),
+                                   set(self.getCheckedHeads()),
+                                   set(self.getCheckedSites()),
+                                   False, True)
+    
+    
+
+
     def onSiteChecked(self):
         # call onSelect if there's item selected in listView
         
@@ -1024,34 +1170,161 @@ class MyWindow(QtWidgets.QMainWindow):
     
     
     def updateTestDataTable(self):
-        if self.data_interface is None:
-            return
-
-        if self.ui.infoBox.currentIndex() != 2:
-            # do nothing if test data table is not selected
-            return
-
-        settings = getSetting()
-        d = self.data_interface.getTestDataTableContent(self.getSelectedTests(), 
-                                                        self.getCheckedHeads(), 
-                                                        self.getCheckedSites())
-    
-    
-    def updateStatTableContent(self):
+        """Synchronous path: query and show the raw data table."""
         if self.data_interface is None:
             return
         
+        if self.ui.infoBox.currentIndex() != self._RAW_DATA_PAGE:
+            # do nothing if test data table is not selected
+            return
+        
+        d = self.data_interface.getTestDataTableContent(self.getSelectedTests(), 
+                                                        self.getCheckedHeads(), 
+                                                        self.getCheckedSites())
+        self.applyTestDataTable(d)
+    
+    
+    def applyTestDataTable(self, d):
+        """GUI thread: show pre-fetched raw data table content."""
+        if d is None or self.ui.infoBox.currentIndex() != self._RAW_DATA_PAGE:
+            # do nothing if test data table is not selected
+            return
+        
+        settings = getSetting()
+        self.tmodel_data.setTestData(d["Data"])
+        self.tmodel_data.setTestInfo(d["TestInfo"])
+        self.tmodel_data.setDutIndexMap(d["dut2ind"])
+        self.tmodel_data.setDutInfoMap(d["dutInfo"])
+        self.tmodel_data.setTestLists(d["TestLists"])
+        self.tmodel_data.setHHeaderBase([self.tr("Part ID"), self.tr("Part Text"), self.tr("Test Head - Site")])
+        self.tmodel_data.setVHeaderBase([self.tr("Test Number"), self.tr("HLimit"), self.tr("LLimit"), self.tr("Unit")])
+        self.tmodel_data.setVHeaderExt(d["VHeader"])
+        self.tmodel_data.setFont(QtGui.QFont(settings.gen.font, 13 if isMac else 10))
+        self.tmodel_data.setFloatFormat(settings.getFloatFormat())
+        self.tmodel_data.layoutChanged.emit()
+        hheaderview = self.ui.rawDataTable.horizontalHeader()
+        hheaderview.setVisible(True)
+        # resize table columns to header string (test name)
+        for col in range(self.tmodel_data.columnCount()):
+            cellWidth = hheaderview.fontMetrics().horizontalAdvance(
+                self.tmodel_data.headerData(col, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
+            )
+            hheaderview.resizeSection(col, max(cellWidth, 80))
+        self.ui.rawDataTable.verticalHeader().setVisible(True)
+    
+                
+    def applyTabContent(self, tabType, payload: dict):
+        """GUI thread: turn the worker's chart data into widgets."""
+        if self.data_interface is None:
+            return
+        selSites = self.getCheckedSites()
+        selHeads = self.getCheckedHeads()
+        # update Test Data table in info tab
+        if tabType == tab.Info:
+            # filter dut summary table if in Info tab and head & site changed
+            self.proxyModel_tmodel_dut.updateHeadsSites(selHeads, selSites)
+            if "rawData" in payload:
+                self.applyTestDataTable(payload["rawData"])
+            return
+
+        # clean all plots in the current layout
+        self.clearCurrentTab(tabType)
+        tabLayout: QtWidgets.QVBoxLayout = self.tab_dict[tabType]["layout"]
+        if tabType in (tab.Trend, tab.Histo):
+            chartArgs = [(testTuple, head, selSites, tabType, data)
+                         for testTuple, head, data in payload.get("plots", [])]
+        elif tabType == tab.Wafer:
+            chartArgs = [(testTuple, None, selSites, tabType, data)
+                         for testTuple, _head, data in payload.get("plots", [])]
+        elif tabType == tab.Bin:
+            chartArgs = [(None, head, selSites, tabType, data)
+                         for head, _site, data in payload.get("binData", [])]
+        else:
+            chartArgs = []
+        t0 = time.perf_counter()
+        attached = 0
+        for args in chartArgs:
+            # plot and attach one chart at a time so a long list of plots cannot
+            # lock the GUI for seconds; the spinner keeps turning meanwhile
+            chart = self.genPlot(*args)
+            if isinstance(chart, QtWidgets.QGraphicsView):
+                tabLayout.addWidget(chart)
+                attached += 1
+                QtWidgets.QApplication.processEvents()
+            elif isinstance(chart, list):
+                for c in chart:
+                    if isinstance(c, QtWidgets.QGraphicsView):
+                        tabLayout.addWidget(c)
+                        attached += 1
+                        QtWidgets.QApplication.processEvents()
+    
+    
+    def updateStatTableContent(self):
+        """Synchronous refresh, kept for callers that need it immediately."""
+        self.applyStatTableContent(self.fetchStatTableContent())
+    
+    
+    def updateTabContent(self):
+        """Synchronous chart refresh (used by the settings dialog)."""
+        if self.data_interface is None:
+            return
+        tabType = self.ui.tabControl.currentIndex()
+        if tabType == tab.Info:
+            self.applyTabContent(tabType, {})
+            return
+        if tabType in (tab.Trend, tab.Histo):
+            plots = [(testTuple, head,
+                      self.data_interface.getTrendChartData(
+                          testTuple, head, self.getCheckedSites()))
+                     for testTuple in self.getSelectedTests()
+                     for head in self.getCheckedHeads()]
+            self.applyTabContent(tabType, {"plots": plots})
+        elif tabType == tab.Wafer:
+            plots = [(testTuple, None,
+                      self.data_interface.getWaferMapData(
+                          testTuple, self.getCheckedSites()))
+                     for testTuple in self.getSelectedTests()]
+            self.applyTabContent(tabType, {"plots": plots})
+        elif tabType == tab.Bin:
+            binData = [(head, site, self.data_interface.getBinChartData(head, site))
+                       for head in self.getCheckedHeads()
+                       for site in self.getCheckedSites()]
+            self.applyTabContent(tabType, {"binData": binData})
+    
+    
+    def fetchStatTableContent(self):
+        """Worker side: query the statistics table data."""
+        if self.data_interface is None:
+            return None
         tabType = self.ui.tabControl.currentIndex()
         selTests = self.getSelectedTests()
+        if tabType in [tab.Info, tab.Trend, tab.Histo, tab.PPQQ]:
+            return self.data_interface.getTestStatistics(selTests,
+                                                         self.getCheckedHeads(),
+                                                         self.getCheckedSites())
+        elif tabType == tab.Correlate:
+            #TODO
+            return None
+        elif tabType == tab.Bin:
+            return self.data_interface.getBinStatistics(self.getCheckedHeads(),
+                                                         self.getCheckedSites())
+        else:
+            # wafer tab
+            return self.data_interface.getWaferStatistics(selTests,
+                                                          self.getCheckedSites())
+    
+    
+    def applyStatTableContent(self, d, tabType=None):
+        """GUI thread: push statistics data into the table models."""
+        if d is None:
+            return
+        if tabType is None:
+            tabType = self.ui.tabControl.currentIndex()
         horizontalHeader = self.ui.dataTable.horizontalHeader()
         verticalHeader = self.ui.dataTable.verticalHeader()
         settings = getSetting()
         
         if tabType in [tab.Info, tab.Trend, tab.Histo, tab.PPQQ]:
-            # get data
-            d = self.data_interface.getTestStatistics(selTests, 
-                                                      self.getCheckedHeads(), 
-                                                      self.getCheckedSites())
             HHeader = d["HHeader"]
             indexOfFail = HHeader.index("Fail Num")
             indexOfCpk = HHeader.index("Cpk")
@@ -1077,13 +1350,6 @@ class MyWindow(QtWidgets.QMainWindow):
             pass
         
         else:
-            if tabType == tab.Bin:
-                d = self.data_interface.getBinStatistics(self.getCheckedHeads(), 
-                                                         self.getCheckedSites())
-            else:
-                # wafer tab
-                d = self.data_interface.getWaferStatistics(selTests, 
-                                                           self.getCheckedSites())
             self.bwmodel.setContent(d["Rows"])
             self.bwmodel.setColumnCount(d["maxLen"])
             self.bwmodel.setHHeader([])
@@ -1104,49 +1370,29 @@ class MyWindow(QtWidgets.QMainWindow):
         horizontalHeader.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         # set min size to avoid "compressed" cells
         horizontalHeader.setMinimumSectionSize(80)
+                
+    def genBinCharts(self, bdata: dict) -> list:
+        '''GUI thread: build the HBIN/SBIN chart pair for one (head, site).'''
+        charts = []
+        bchartgen = BinChartGenerator()
+        bchartgen.setBinData(bdata)
+        if bchartgen.validData:
+            for isHBIN in [True, False]:
+                gvm = bchartgen.genGraphicView(isHBIN)
+                gvm.setShowDutSignal(self.signals.showDutDataSignal_Bin)
+                charts.append(gvm)
+        return charts
     
     
-    def updateTabContent(self):
-        if self.data_interface is None:
-            return
-        
-        tabType = self.ui.tabControl.currentIndex()
-        selSites = self.getCheckedSites()
-        selHeads = self.getCheckedHeads()
-        # update Test Data table in info tab
-        if tabType == tab.Info:
-            # filter dut summary table if in Info tab and head & site changed
-            self.proxyModel_tmodel_dut.updateHeadsSites(selHeads, selSites)
-            self.updateTestDataTable()
-            return
-        
-        # get selected tests
-        if tabType in [tab.Bin, tab.Correlate]:
-            # BinChart & correlation are irrelevent to tests, 
-            # fake a list with only one element
-            selTests = [""]
-        else:
-            selTests = self.getSelectedTests()
-        # clean all plots in the current layout
-        self.clearCurrentTab(tabType)
-        tabLayout: QtWidgets.QVBoxLayout = self.tab_dict[tabType]["layout"]
-        for testTuple, head in product(selTests, selHeads):
-            chart = self.genPlot(testTuple, head, selSites, tabType)
-            if isinstance(chart, QtWidgets.QGraphicsView):
-                tabLayout.addWidget(chart)
-            elif isinstance(chart, list):
-                for c in chart:
-                    if isinstance(c, QtWidgets.QGraphicsView):
-                        tabLayout.addWidget(c)
-    
-    
-    def genPlot(self, testTuple: tuple, head: int, selectSites: list[int], tabType: tab):
+    def genPlot(self, testTuple: tuple, head: int, selectSites: list[int], tabType: tab, data=None):
         '''
         testTuple: (test_num, pmr, test_name)
         For wafer: (wafer index, file id, wafer name)
+        `data` is pre-fetched chart data from the selection worker; when it is
+        None the query is done here (synchronous path).
         '''
         if tabType == tab.Trend:
-            tdata = self.data_interface.getTrendChartData(testTuple, head, selectSites)
+            tdata = data if data is not None else self.data_interface.getTrendChartData(testTuple, head, selectSites)
             tchart = TrendChart()
             tchart.setFileNames(self.data_interface.getFileNames())
             tchart.setData(tdata)
@@ -1155,7 +1401,7 @@ class MyWindow(QtWidgets.QMainWindow):
                 return tchart
         
         elif tabType == tab.Histo:
-            tdata = self.data_interface.getTrendChartData(testTuple, head, selectSites)
+            tdata = data if data is not None else self.data_interface.getTrendChartData(testTuple, head, selectSites)
             hchart = HistoChart()
             hchart.setFileNames(self.data_interface.getFileNames())
             hchart.setData(tdata)
@@ -1164,7 +1410,7 @@ class MyWindow(QtWidgets.QMainWindow):
                 return hchart
         
         elif tabType == tab.Wafer:
-            wdata = self.data_interface.getWaferMapData(testTuple, selectSites)
+            wdata = data if data is not None else self.data_interface.getWaferMapData(testTuple, selectSites)
             wchart = WaferMap()
             wchart.setWaferData(wdata)
             if wchart.validData:
@@ -1172,22 +1418,12 @@ class MyWindow(QtWidgets.QMainWindow):
                 return wchart
         
         elif tabType == tab.Bin:
-            bcharts = []
-            # one site per binchart
-            for site in selectSites:
-                bdata = self.data_interface.getBinChartData(head, site)
-                bchartgen = BinChartGenerator()
-                bchartgen.setBinData(bdata)
-                if bchartgen.validData:
-                    for isHBIN in [True, False]:
-                        gvm = bchartgen.genGraphicView(isHBIN)
-                        gvm.setShowDutSignal(self.signals.showDutDataSignal_Bin)
-                        bcharts.append(gvm)
-            return bcharts
+            bdata = data if data is not None else self.data_interface.getBinChartData(head, selectSites[0])
+            return self.genBinCharts(bdata)
         
         return None
-    
-    
+            
+            
     def getFileInfoForReport(self):
         # this table uses standarded model
         model = self.tmodel_info
@@ -1329,6 +1565,7 @@ class MyWindow(QtWidgets.QMainWindow):
     @Slot(object)
     def updateData(self, newDI: DataInterface):
         if newDI is not None:
+            self.showBusy()
             # clear old images & tables
             self.clearAllContents()
             # close old data interface first
@@ -1442,9 +1679,16 @@ class MyWindow(QtWidgets.QMainWindow):
             self.updateFileHeader()
             self.updateDutSummaryTable()
             self.updateGDR_DTR_Table()
-            # the database is usable from here on
+            # the database is usable from here on: the spinner narrows down to
+            # the statistics box / chart tab that are about to be filled in
             self._fileLoading = False
             self.onSelect()
+            if self._pendingSelect is None:
+                # statistics/charts are already up to date; still wait for the
+                # first paint before dropping the overlay
+                self._hideBusyAfterPaint()
+            # otherwise onSelectionReady() clears the busy state when the
+            # worker thread hands over the first selection's data
 
     
     @Slot(int)
@@ -1454,10 +1698,71 @@ class MyWindow(QtWidgets.QMainWindow):
         self.loaderProgress.setFormat("%.2f%%" % (num / 100.0))
         self.loaderProgress.show()
 
+    def _statisticsPane(self):
+        """The 'Test Statistics' group box, where stats are rendered."""
+        return getattr(self.ui, "groupBox_stats", None)
+
+    def _isPaneAllowedToBeBusy(self, pane) -> bool:
+        """Only the Detailed Info tab itself is off limits; its stats box is not."""
+        if pane is None:
+            return False
+        return pane is not getattr(self.ui, "info_tab", None)
+
+
+    def showBusy(self, text="Loading...", panes=None):
+        """Start a spinner on the panes that are doing the work."""
+        if panes is None:
+            panes = self._defaultBusyPanes()
+        self._busy.show(text, panes)
+
+    def _defaultBusyPanes(self) -> list:
+        """Panes that are busy without an explicit target."""
+        if self._fileLoading:
+            return self._allPanes()
+        panes = []
+        if self.data_interface is not None:
+            stats = self._statisticsPane()
+            if stats is not None:
+                panes.append(stats)
+            page = self.ui.tabControl.currentWidget()
+            if page is not None and self._isPaneAllowedToBeBusy(page):
+                panes.append(page)
+        else:
+            panes.extend(self._allPanes())
+        return panes
+
+    def _allPanes(self) -> list:
+        """Every pane that may spin during a whole-file operation."""
+        panes = []
+        for name in ("test_selection", "wafer_selection"):
+            pane = getattr(self.ui, name, None)
+            if pane is not None:
+                panes.append(pane)
+        stats = self._statisticsPane()
+        if stats is not None:
+            panes.append(stats)
+        for index in range(self.ui.tabControl.count()):
+            page = self.ui.tabControl.widget(index)
+            if page is not None and self._isPaneAllowedToBeBusy(page):
+                panes.append(page)
+        return panes
+
+    def hideBusy(self):
+        self._busy.hide()
+
+    def showBusyOnVisiblePages(self, *_):
+        """Re-attach the spinners after the user switched to another page."""
+        self._busy.reattach()
+
     @Slot()
     def prepareForLoading(self):
         """Clear the previous file's UI before a new load starts."""
+        # any selection work of the previous file must not touch the new UI
+        self._selectDebounce.stop()
+        self._pendingSelect = None
+        self._selectionGen += 1
         self._fileLoading = True
+        self.showBusy()
         self.loaderProgress.setValue(0)
         self.loaderProgress.setFormat("0.00%")
         self.loaderProgress.show()
@@ -1625,6 +1930,18 @@ class MyWindow(QtWidgets.QMainWindow):
         return False
       
         
+    def closeEvent(self, event):
+        # stop the selection worker before the GUI goes away
+        try:
+            self._selectDebounce.stop()
+            if self._selectionWorker is not None:
+                self._selectionWorker.shutdown()
+                self._selectionWorker = None
+        except Exception:
+            logger.exception("cannot stop the selection worker")
+        super().closeEvent(event)
+    
+    
     def onException(self, errorType, errorValue, tb):
         logger.error("Uncaught Error occurred", exc_info=(errorType, errorValue, tb))
         errMsg = traceback.format_exception(errorType, errorValue, tb, limit=0)
