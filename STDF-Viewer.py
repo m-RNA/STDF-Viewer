@@ -158,6 +158,9 @@ class MyWindow(QtWidgets.QMainWindow):
         self._closeRequested = False
         self.loader.signals.progressBarSignal.connect(self.onLoaderProgress)
         self.loader.signals.statsSignal.connect(self.updateEarlyStats)
+        # the loader emits this when its thread is done; if the user asked to
+        # close while it was building, the window goes away now that it is safe
+        self.loader.signals.closeSignal.connect(self.onLoaderFinished)
         # selection queries run on a worker thread; results land in the GUI
         # thread through this queued signal
         self._selectionWorker = None
@@ -1691,10 +1694,6 @@ class MyWindow(QtWidgets.QMainWindow):
                 self._hideBusyAfterPaint()
             # otherwise onSelectionReady() clears the busy state when the
             # worker thread hands over the first selection's data
-            if self._closeRequested:
-                # the user wanted out while this was still building; the loader
-                # has finished, so closing now does not cut the thread short
-                self.close()
 
     
     @Slot(int)
@@ -1936,6 +1935,14 @@ class MyWindow(QtWidgets.QMainWindow):
         return False
       
         
+    @Slot()
+    def onLoaderFinished(self):
+        """The loader thread is done -- stopped early or finished normally."""
+        if self._closeRequested:
+            # the build was cut short, so the "database is ready" path will not
+            # run; this is the only place left that closes the window
+            self.close()
+
     def closeEvent(self, event):
         # A build in progress is the loader's business: ask before dropping it
         # and let the thread finish instead of killing it. Same check as on the
