@@ -296,6 +296,14 @@ class DatabaseFetcherRust:
         self.checkConnection()
         return self._fetcher.get_dut_count_dict()
 
+    def getSiteSummaryRows(self) -> list:
+        """(file, head, site, records, pass, fail, unknown, superseded).
+
+        Raw stream counts: repeated PartIDs and superseded tests remain included.
+        """
+        self.checkConnection()
+        return self._fetcher.get_site_summary_rows()
+
     def getDUTCountOnConditions(self, head: int, site: int, waferid: int, fid: int):
         """Return ``[Pass, Failed, Unknown, Superseded]`` counts for the given filters.
 

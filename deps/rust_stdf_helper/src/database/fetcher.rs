@@ -40,6 +40,8 @@ pub type TestFailCntRow = (i64, String, Vec<Option<i64>>);
 pub type BinInfoRow = (i64, Option<String>, Option<String>);
 /// `(max X, min X, max Y, min Y)`; a value is None when no DUT matches.
 pub type WaferBounds = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+/// Raw test streams: (file, head, site, total, pass, fail, unknown, superseded).
+pub type SiteSummaryRow = (i64, i64, i64, i64, i64, i64, i64, i64);
 /// One `getPinNames()` row:
 /// `(PMR_INDX, LOG_NAM, PHY_NAM, HEAD_NUM, SITE_NUM, CHAN_NAM)`.
 pub type PinNameRow = (i64, String, String, i64, i64, String);
@@ -1121,6 +1123,16 @@ impl DataFetcher {
             }
         }
         Ok(counts)
+    }
+
+    /// Include every DUT record, including retests and superseded records.
+    pub fn site_summary_rows(&self) -> Result<Vec<SiteSummaryRow>, StdfHelperError> {
+        let mut stmt = self.conn.prepare_cached(FETCH_SELECT_SITE_SUMMARY)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// `getByteOrder()` — one bool per `File_Info` row with `BYTE_ORD`,

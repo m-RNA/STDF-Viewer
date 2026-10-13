@@ -48,6 +48,7 @@ class DataInterface:
         # all test list or wafers in the database
         self.completeTestList = []
         self.completeWaferList = []
+        self.siteSummaryRows = []
         # cache test pin list and names for MPR
         self.pinInfoDictCache = {}
 
@@ -83,6 +84,12 @@ class DataInterface:
         self.noPartTXT = self.DatabaseFetcher.isDutInfoColumnEmpty("PartText")
         self.noWaferID = self.DatabaseFetcher.isDutInfoColumnEmpty("WaferIndex")
         self.noWaferXY = self.DatabaseFetcher.isDutInfoColumnEmpty("XCOORD")
+        self.siteSummaryRows = self.DatabaseFetcher.getSiteSummaryRows()
+
+
+    def getSiteMapData(self, heads, sites, files):
+        from deps.SiteMap import summarize_sites
+        return summarize_sites(self.siteSummaryRows, heads, sites, files)
         
         
     def close(self):

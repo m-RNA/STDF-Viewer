@@ -609,6 +609,16 @@ pub(crate) mod fetcher_queries {
 
     /****** DUT-level queries ******/
 
+    pub(crate) static FETCH_SELECT_SITE_SUMMARY: &str = "SELECT
+        Fid, HEAD_NUM, SITE_NUM, COUNT(*),
+        COALESCE(SUM(Flag & 24 = 0), 0),
+        COALESCE(SUM(Flag & 24 = 8), 0),
+        COALESCE(SUM(Flag IS NULL OR Flag & 16 != 0), 0),
+        COALESCE(SUM(Supersede = 1), 0)
+    FROM Dut_Info
+    GROUP BY Fid, HEAD_NUM, SITE_NUM
+    ORDER BY Fid, HEAD_NUM, SITE_NUM";
+
     /// The cheapest statement that reads the database file.
     ///
     /// Used as the first statement for QtSql, see `start_index_build` for detail.

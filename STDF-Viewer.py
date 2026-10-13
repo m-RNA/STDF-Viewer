@@ -34,6 +34,7 @@ from deps.ui.transSrc import transDict
 from deps.DataInterface import DataInterface
 from deps.customizedQtClass import *
 from deps.ChartWidgets import *
+from deps.SiteMapWidget import SiteMapWidget
 from deps.StdLoader import StdfLoader
 from deps.ViewerInstance import ViewerInstance
 from deps.uic_stdMerge import MergePanel
@@ -213,6 +214,12 @@ class MyWindow(QtWidgets.QMainWindow):
         # data_interface for processing requests by GUI 
         # and reading data from database
         self.data_interface = None
+        self.siteMap = SiteMapWidget(self)
+        self.ui.tabControl.addTab(self.siteMap, "Site Map")
+        self.ui.tabControl.setTabEnabled(tab.SiteMap, False)
+        self.siteMap.siteActivated.connect(self.onReadDutData_SiteMap)
+        self.siteMap.headChanged.connect(self.updateStatTableContent)
+        self.ui.dataTable.doubleClicked.connect(self.onSiteTableActivated)
         # database for dut summary and GDR/DTR table
         self.db_dut = QtSql.QSqlDatabase.addDatabase("QSQLITE")
         # used for detecting tab changes
@@ -407,6 +414,8 @@ class MyWindow(QtWidgets.QMainWindow):
         # mainUI
         _app.installTranslator(self.translatorUI)
         self.ui.retranslateUi(self)
+        self.siteMap.retranslate(curLang == "简体中文")
+        self.ui.tabControl.setTabText(tab.SiteMap, self.siteMap.text("Site Map"))
         # loader
         _app.installTranslator(self.loader.translator)
         # exporter
@@ -733,6 +742,24 @@ class MyWindow(QtWidgets.QMainWindow):
         selectedDutIndex = self.data_interface.DatabaseFetcher.getDUTIndexFromXY(selectedDie)
         if selectedDutIndex:
             self.showDutDataTable(selectedDutIndex)
+
+
+    @Slot(int, int)
+    def onReadDutData_SiteMap(self, head, site):
+        if self.data_interface is None:
+            return
+        indices = self.data_interface.DatabaseFetcher.getDutIndexDictFromHeadSite(
+            [head], [site], self.getCheckedFiles())
+        selected = [(fid, int(index)) for fid, duts in indices.items() for index in duts]
+        if selected:
+            self.showDutDataTable(selected)
+
+
+    def onSiteTableActivated(self, index):
+        if self.ui.tabControl.currentIndex() == tab.SiteMap:
+            identity = index.data(Qt.UserRole)
+            if identity:
+                self.onReadDutData_SiteMap(*identity)
     
     
     def enableDragDrop(self):
@@ -1224,7 +1251,7 @@ class MyWindow(QtWidgets.QMainWindow):
         else:
             self.ui.Selection_stackedWidget.setCurrentIndex(0)
         
-        if currentTab in [tab.Bin, tab.Correlate]:
+        if currentTab in [tab.Bin, tab.Correlate, tab.SiteMap]:
             self.ui.TestList.setDisabled(True)
             self.ui.SearchBox.setDisabled(True)
             self.ui.ClearButton.setDisabled(True)
@@ -1253,7 +1280,7 @@ class MyWindow(QtWidgets.QMainWindow):
                 self.proxyModel_tmodel_datalog.setSelectedFiles(selFiles)
                 # row heights are not preserved when the proxy re-filters
                 self.ui.datalogTable.resizeRowsToContents()
-            selTests = set(self.getSelectedTests())
+            selTests = set() if currentTab == tab.SiteMap else set(self.getSelectedTests())
 
             if (preHeads != selHeads or
                 preSites != selSites or
@@ -1367,6 +1394,10 @@ class MyWindow(QtWidgets.QMainWindow):
         selSites = self.getCheckedSites()
         selHeads = self.getCheckedHeads()
         selFiles = self.getCheckedFiles()
+        if tabType == tab.SiteMap:
+            self.siteMap.setData(self.data_interface.getSiteMapData(selHeads, selSites, selFiles), selSites)
+            self.updateStatTableContent()
+            return
         # update Test Data table in info tab
         if tabType == tab.Info:
             # filter dut summary table if in Info tab and head & site changed
@@ -1404,6 +1435,31 @@ class MyWindow(QtWidgets.QMainWindow):
         horizontalHeader = self.ui.dataTable.horizontalHeader()
         verticalHeader = self.ui.dataTable.verticalHeader()
         settings = getSetting()
+        if tabType == tab.SiteMap:
+            model = QtGui.QStandardItemModel(self.ui.dataTable)
+            headers = ["Head", "Site", "Records", "PASS", "FAIL", "Unknown", "Superseded", "Yield"]
+            model.setHorizontalHeaderLabels([self.siteMap.text(value) for value in headers])
+            for summary in self.siteMap.visibleRows():
+                yield_text = f"{summary.yield_percent:.2f}%" if summary.yield_percent is not None else "N/A"
+                values = [summary.head, summary.site, summary.records, summary.passed, summary.failed,
+                          summary.unknown, summary.superseded, yield_text]
+                items = []
+                for value in values:
+                    item = QtGui.QStandardItem(str(value))
+                    item.setEditable(False)
+                    item.setData((summary.head, summary.site), Qt.UserRole)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    items.append(item)
+                model.appendRow(items)
+            old = getattr(self, "siteMapTableModel", None)
+            self.siteMapTableModel = model
+            self.ui.dataTable.setModel(model)
+            if old is not None:
+                old.deleteLater()
+            horizontalHeader.setVisible(True)
+            verticalHeader.setVisible(False)
+            horizontalHeader.setSectionResizeMode(QHeaderView.ResizeToContents)
+            return
         
         if tabType in [tab.Info, tab.Trend, tab.Histo, tab.PPQQ]:
             # get data
@@ -1629,6 +1685,8 @@ class MyWindow(QtWidgets.QMainWindow):
                   tab.Bin, tab.Wafer, tab.Correlate]:
             self.clearCurrentTab(t)
         self.selectionTracker = {}
+        self.siteMap.setData([], [])
+        self.ui.tabControl.setTabEnabled(tab.SiteMap, False)
         self.fileMetaData = []
         gc.collect()
     
@@ -1698,6 +1756,7 @@ class MyWindow(QtWidgets.QMainWindow):
             
             # disable/enable wafer tab
             self.ui.tabControl.setTabEnabled(tab.Wafer, self.data_interface.containsWafer)
+            self.ui.tabControl.setTabEnabled(tab.SiteMap, bool(self.data_interface.siteSummaryRows))
     
             # update listView
             self.completeTestList = self.data_interface.completeTestList
@@ -1843,6 +1902,10 @@ class MyWindow(QtWidgets.QMainWindow):
         self._fileLoading = loading
         self.ui.tabControl.setTabEnabled(tab.Info, True)
         for index in range(self.ui.tabControl.count()):
+            if index == tab.SiteMap:
+                enabled = not loading and self.data_interface is not None and bool(self.data_interface.siteSummaryRows)
+                self.ui.tabControl.setTabEnabled(index, enabled)
+                continue
             if index == tab.Wafer:
                 # the file decides this one, unlocking it here overrides updateData
                 continue

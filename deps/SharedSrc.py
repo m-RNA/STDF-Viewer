@@ -317,6 +317,7 @@ class tab(IntEnum):
     Bin = 4
     Wafer = 5
     Correlate = 6
+    SiteMap = 7
     
 
 class REC(IntEnum):

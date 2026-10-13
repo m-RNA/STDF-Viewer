@@ -201,6 +201,23 @@ Display histograms of dut counts of each hardware bin and software bin in select
 
 <br>
 
+### Site position map
+
+The independent `Site Map` tab summarizes raw DUT test records by test head and site.
+It does not require wafer records or XY coordinates, and does not change the existing wafer map.
+Retests and superseded records remain included; counters represent test executions, not unique parts.
+File, head, and site filters are shared with the other views, while the head selector keeps
+identically numbered sites on different heads separate.
+
+The compact double-ring chart has 32 sectors per ring: sites 1-32 inside and 33-64 outside.
+The gaps between 32/1 and 64/33 align at six o'clock, with clockwise numbering. Colors show failure rate,
+failure count, or test count. Hover for counts and yield, double-click a sector or its statistics
+row for the raw records, and use the save icon to export PNG. Unknown results are excluded from
+the yield denominator. Sites outside 1-64 stay in the statistics table and are marked unmapped.
+
+Panel/wafer positions before singulation are a separate identity and are not inferred from site
+numbers. Tests run with `python -m unittest discover -s tests -v` after rebuilding the Rust helper.
+
 ### Viewing wafer maps
 If STDF files contain wafer information (WCR, WIR, WRR records), the `Wafer Map` tab will be enabled. 
 

@@ -13,7 +13,7 @@
 //
 
 use crate::database::fetcher::{
-    DataFetcher, FetchedTestData, FileId, PinNameRow, TestData, WaferBounds,
+    DataFetcher, FetchedTestData, FileId, PinNameRow, SiteSummaryRow, TestData, WaferBounds,
 };
 use crate::generic::error::StdfHelperError;
 use numpy::ndarray::Array1;
@@ -278,6 +278,11 @@ impl PyDataFetcher {
     }
 
     // ----- DUT-level summary queries -----
+
+    pub fn get_site_summary_rows(&mut self, py: Python<'_>) -> PyResult<Vec<SiteSummaryRow>> {
+        let inner = &mut self.inner;
+        Ok(py.detach(move || inner.site_summary_rows())?)
+    }
 
     pub fn get_dut_count_dict<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let inner = &mut self.inner;
