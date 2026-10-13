@@ -84,6 +84,8 @@ pip install /path/to/whl/file
 
 4. 至此你可以直接运行`STDF-Viewer.py`，也可以用你顺手的工具打包成一个可执行程序。
 
+Windows 下配置好项目 `.venv` 后，双击 `start-viewer.bat` 即可启动源码版，不保留控制台窗口；也可以把一个或多个 STDF 文件拖到此脚本上打开。缺少依赖时会显示错误并暂停，诊断保存在 `logs/launcher-check.log` 和 `logs/launcher.log`。启动器不会自动安装或更新依赖。
+
 
 ## **使用方法**
 

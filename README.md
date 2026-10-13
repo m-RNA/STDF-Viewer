@@ -92,6 +92,8 @@ pip install /path/to/whl/file
 
 4. You can run `STDF-Viewer.py` directly, or using your favorite tool to bundle it to an executable.
 
+On Windows, after setting up the project `.venv`, double-click `start-viewer.bat` to launch the source version without a console window. You can also drag one or more STDF files onto the batch file. Missing dependencies are reported before launch; diagnostics are saved in `logs/launcher-check.log` and `logs/launcher.log`. The launcher does not install or update dependencies.
+
 
 ## **Usage**
 
